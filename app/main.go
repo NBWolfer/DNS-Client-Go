@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// Ensures gofmt doesn't remove the "net" import in stage 1 (feel free to remove this!)
 var _ = net.ListenUDP
 
 type DNSHeader struct {
@@ -64,6 +63,7 @@ func main() {
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
 
+		// Test response
 		header := DNSHeader{
 			ID:      1234,
 			QR:      true,
@@ -91,7 +91,6 @@ func main() {
 			Questions: []DNSQuestion{question},
 		}
 
-		// Create an empty response
 		response := append(dnsMessage.Header, encodeDNSQuestion(dnsMessage.Questions[0])...)
 
 		fmt.Println("Response:", response)
@@ -112,7 +111,6 @@ func boolToByte(value bool) byte {
 func encodeDNSHeader(header DNSHeader) []byte {
 	buffer := make([]byte, 12)
 
-	// Integers should be encoded in big-endian
 	buffer[0] = byte(header.ID >> 8)
 	buffer[1] = byte(header.ID)
 
@@ -144,21 +142,15 @@ func domainNameEncoding(domain string) []byte {
 	// <length> <label> <length> <label> ...
 	// google.com -> \x06google\x03com\x00 in hex (06 67 6f 6f 67 6c 65 03 63 6f 6d 00)
 
-	// Split the domain into labels
 	labels := strings.Split(domain, ".")
 
-	// Create a buffer to store the encoded domain name
 	buffer := make([]byte, 0)
 
 	for _, label := range labels {
-		// Encode the length of the label
 		buffer = append(buffer, byte(len(label)))
 
-		// Encode the label itself
 		buffer = append(buffer, []byte(label)...)
 	}
-
-	// Terminate the domain name with a null byte
 	buffer = append(buffer, 0)
 
 	return buffer
