@@ -1,12 +1,11 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
 )
-
-var _ = net.ListenUDP
 
 type DNSHeader struct {
 	ID      uint16
@@ -25,19 +24,22 @@ type DNSHeader struct {
 }
 
 type DNSQuestion struct {
-	QNAME  []byte
+	QNAME  string // ASCII olarak tutuyoruz (örn: "google.com")
 	QTYPE  uint16
 	QCLASS uint16
 }
 
-type DNSMessage struct {
-	Header    []byte
-	Questions []DNSQuestion
+// Sunucu tarafında ANSWER’ı da “ham wire format” domain şeklinde encode edeceğiz.
+type DNSAnswer struct {
+	NAME     []byte // Wire formatta (örn: [6 g o o g l e 3 c o m 0])
+	TYPE     uint16
+	CLASS    uint16
+	TTL      uint32
+	RDLENGTH uint16
+	RDATA    []byte
 }
 
 func main() {
-	fmt.Println("Logs from your program will appear here!")
-
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
 	if err != nil {
 		fmt.Println("Failed to resolve UDP address:", err)
@@ -51,6 +53,8 @@ func main() {
 	}
 	defer udpConn.Close()
 
+	fmt.Println("DNS Server listening on", udpAddr)
+
 	buf := make([]byte, 512)
 
 	for {
@@ -60,40 +64,104 @@ func main() {
 			break
 		}
 
-		receivedData := string(buf[:size])
-		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
+		if size < 12 {
+			continue
+		}
 
-		// Test response
-		header := DNSHeader{
-			ID:      1234,
-			QR:      true,
-			OPCODE:  0,
+		testerId := binary.BigEndian.Uint16(buf[0:2])
+		flags := binary.BigEndian.Uint16(buf[2:4])
+		qdCount := binary.BigEndian.Uint16(buf[4:6])
+
+		qr := (flags & 0x8000) != 0
+		opcode := uint8((flags >> 11) & 0x0F)
+		rd := (flags & 0x0100) != 0
+
+		// Sunucu cevabında:
+		// - QR = 1 (cevap paketi)
+		// - OPCODE = aynısı
+		// - RD = aynısı
+		// - RCODE = 0 (hata yok) (eğer opcode=0 ise)
+		rcodeValue := uint8(0)
+		if opcode != 0 {
+			// Sadece opcode=0 (standard query) destekliyoruz
+			rcodeValue = 4 // Not Implemented
+		}
+
+		// DNS header inşa edelim
+		dnsHeader := DNSHeader{
+			ID:      testerId,
+			QR:      qr,
+			OPCODE:  opcode,
 			AA:      false,
 			TC:      false,
-			RD:      false,
+			RD:      rd,
 			RA:      false,
 			Z:       0,
-			RCODE:   0,
-			QDCOUNT: 1,
+			RCODE:   rcodeValue,
+			QDCOUNT: qdCount,
 			ANCOUNT: 0,
 			NSCOUNT: 0,
 			ARCOUNT: 0,
 		}
 
-		question := DNSQuestion{
-			QNAME:  domainNameEncoding("google.com"),
-			QTYPE:  1,
-			QCLASS: 1,
+		offset := 12
+		questions := make([]DNSQuestion, 0)
+
+		for i := 0; i < int(qdCount); i++ {
+			qname, nextOffset := decodeDomainNameToASCII(buf, offset)
+			qtype := binary.BigEndian.Uint16(buf[nextOffset : nextOffset+2])
+			qclass := binary.BigEndian.Uint16(buf[nextOffset+2 : nextOffset+4])
+
+			questions = append(questions, DNSQuestion{
+				QNAME:  qname,
+				QTYPE:  qtype,
+				QCLASS: qclass,
+			})
+
+			offset = nextOffset + 4
 		}
 
-		dnsMessage := DNSMessage{
-			Header:    encodeDNSHeader(header),
-			Questions: []DNSQuestion{question},
+		// Cevapları hazırlayalım
+		answers := make([]DNSAnswer, 0)
+		for _, q := range questions {
+			// Yalnızca A kaydı (QTYPE=1) ve IN class (QCLASS=1) için cevap veriyoruz
+			if q.QTYPE == 1 && q.QCLASS == 1 {
+				wireDomain := domainNameEncoding(q.QNAME)
+				ans := DNSAnswer{
+					NAME:     wireDomain,
+					TYPE:     1, // A kaydı
+					CLASS:    1, // IN
+					TTL:      60,
+					RDLENGTH: 4,
+					RDATA:    []byte{8, 8, 8, 8},
+				}
+				answers = append(answers, ans)
+			}
 		}
 
-		response := append(dnsMessage.Header, encodeDNSQuestion(dnsMessage.Questions[0])...)
+		dnsHeader.ANCOUNT = uint16(len(answers))
 
-		fmt.Println("Response:", response)
+		response := make([]byte, 0)
+		response = append(response, encodeDNSHeader(dnsHeader)...)
+
+		// 2) Questions
+		for _, q := range questions {
+			wireDomain := domainNameEncoding(q.QNAME)
+			response = append(response, wireDomain...)
+
+			tmp := make([]byte, 2)
+			binary.BigEndian.PutUint16(tmp, q.QTYPE)
+			response = append(response, tmp...)
+
+			binary.BigEndian.PutUint16(tmp, q.QCLASS)
+			response = append(response, tmp...)
+		}
+
+		// 3) Answers
+		for _, ans := range answers {
+			response = append(response, encodeDNSAnswer(ans)...)
+		}
+
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
@@ -101,57 +169,91 @@ func main() {
 	}
 }
 
-func boolToByte(value bool) byte {
-	if value {
-		return 1
+func decodeDomainNameToASCII(buf []byte, offset int) (string, int) {
+	labels := []string{}
+	for {
+		length := int(buf[offset])
+		if length == 0 {
+			offset++
+			break
+		}
+		// Label’ın uzunluğu kadar ilerle
+		offset++
+		label := buf[offset : offset+length]
+		offset += length
+		labels = append(labels, string(label))
 	}
-	return 0
-}
-
-func encodeDNSHeader(header DNSHeader) []byte {
-	buffer := make([]byte, 12)
-
-	buffer[0] = byte(header.ID >> 8)
-	buffer[1] = byte(header.ID)
-
-	// Encode the flags
-	flags := uint16(0)
-	flags |= uint16(boolToByte(header.QR)) << 15
-	flags |= uint16(header.OPCODE) << 11
-	flags |= uint16(boolToByte(header.AA)) << 10
-	flags |= uint16(boolToByte(header.TC)) << 9
-	flags |= uint16(boolToByte(header.RD)) << 8
-	flags |= uint16(boolToByte(header.RA)) << 7
-	flags |= uint16(header.Z) << 4
-
-	buffer[2] = byte(flags >> 8)
-	buffer[3] = byte(flags)
-
-	return buffer
-}
-
-func encodeDNSQuestion(question DNSQuestion) []byte {
-	buffer := make([]byte, 0)
-	buffer = append(buffer, question.QNAME...)
-	buffer = append(buffer, byte(question.QTYPE>>8), byte(question.QTYPE))
-	buffer = append(buffer, byte(question.QCLASS>>8), byte(question.QCLASS))
-	return buffer
+	// labels birleştir
+	domain := strings.Join(labels, ".")
+	return domain, offset
 }
 
 func domainNameEncoding(domain string) []byte {
-	// <length> <label> <length> <label> ...
-	// google.com -> \x06google\x03com\x00 in hex (06 67 6f 6f 67 6c 65 03 63 6f 6d 00)
-
 	labels := strings.Split(domain, ".")
-
-	buffer := make([]byte, 0)
-
+	var out []byte
 	for _, label := range labels {
-		buffer = append(buffer, byte(len(label)))
-
-		buffer = append(buffer, []byte(label)...)
+		out = append(out, byte(len(label)))
+		out = append(out, label...)
 	}
-	buffer = append(buffer, 0)
+	out = append(out, 0)
+	return out
+}
 
-	return buffer
+func encodeDNSHeader(h DNSHeader) []byte {
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint16(buf[0:2], h.ID)
+
+	// Flags (QR, OPCODE, RD vs.)
+	var flags uint16
+	if h.QR {
+		flags |= 1 << 15
+	}
+	flags |= (uint16(h.OPCODE) & 0xF) << 11
+	if h.AA {
+		flags |= 1 << 10
+	}
+	if h.TC {
+		flags |= 1 << 9
+	}
+	if h.RD {
+		flags |= 1 << 8
+	}
+	if h.RA {
+		flags |= 1 << 7
+	}
+
+	// RCODE
+	flags |= uint16(h.RCODE) & 0xF
+
+	binary.BigEndian.PutUint16(buf[2:4], flags)
+	binary.BigEndian.PutUint16(buf[4:6], h.QDCOUNT)
+	binary.BigEndian.PutUint16(buf[6:8], h.ANCOUNT)
+	binary.BigEndian.PutUint16(buf[8:10], h.NSCOUNT)
+	binary.BigEndian.PutUint16(buf[10:12], h.ARCOUNT)
+	return buf
+}
+
+// encodeDNSAnswer: NAME, TYPE, CLASS, TTL, RDLENGTH, RDATA
+func encodeDNSAnswer(ans DNSAnswer) []byte {
+	var buf []byte
+
+	buf = append(buf, ans.NAME...)
+
+	tmp2 := make([]byte, 2)
+	binary.BigEndian.PutUint16(tmp2, ans.TYPE)
+	buf = append(buf, tmp2...)
+
+	binary.BigEndian.PutUint16(tmp2, ans.CLASS)
+	buf = append(buf, tmp2...)
+
+	tmp4 := make([]byte, 4)
+	binary.BigEndian.PutUint32(tmp4, ans.TTL)
+	buf = append(buf, tmp4...)
+
+	binary.BigEndian.PutUint16(tmp2, ans.RDLENGTH)
+	buf = append(buf, tmp2...)
+
+	buf = append(buf, ans.RDATA...)
+
+	return buf
 }
