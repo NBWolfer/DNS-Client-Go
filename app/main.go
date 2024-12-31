@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"strings"
 )
 
 // Ensures gofmt doesn't remove the "net" import in stage 1 (feel free to remove this!)
@@ -24,8 +25,15 @@ type DNSHeader struct {
 	ARCOUNT uint16
 }
 
+type DNSQuestion struct {
+	QNAME  []byte
+	QTYPE  uint16
+	QCLASS uint16
+}
+
 type DNSMessage struct {
-	Header DNSHeader
+	Header    []byte
+	Questions []DNSQuestion
 }
 
 func main() {
@@ -66,14 +74,26 @@ func main() {
 			RA:      false,
 			Z:       0,
 			RCODE:   0,
-			QDCOUNT: 0,
+			QDCOUNT: 1,
 			ANCOUNT: 0,
 			NSCOUNT: 0,
 			ARCOUNT: 0,
 		}
 
+		question := DNSQuestion{
+			QNAME:  domainNameEncoding("google.com"),
+			QTYPE:  1,
+			QCLASS: 1,
+		}
+
+		dnsMessage := DNSMessage{
+			Header:    encodeDNSHeader(header),
+			Questions: []DNSQuestion{question},
+		}
+
 		// Create an empty response
-		response := encodeDNSHeader(header)
+		response := append(dnsMessage.Header, encodeDNSQuestion(dnsMessage.Questions[0])...)
+
 		fmt.Println("Response:", response)
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
@@ -108,6 +128,38 @@ func encodeDNSHeader(header DNSHeader) []byte {
 
 	buffer[2] = byte(flags >> 8)
 	buffer[3] = byte(flags)
+
+	return buffer
+}
+
+func encodeDNSQuestion(question DNSQuestion) []byte {
+	buffer := make([]byte, 0)
+	buffer = append(buffer, question.QNAME...)
+	buffer = append(buffer, byte(question.QTYPE>>8), byte(question.QTYPE))
+	buffer = append(buffer, byte(question.QCLASS>>8), byte(question.QCLASS))
+	return buffer
+}
+
+func domainNameEncoding(domain string) []byte {
+	// <length> <label> <length> <label> ...
+	// google.com -> \x06google\x03com\x00 in hex (06 67 6f 6f 67 6c 65 03 63 6f 6d 00)
+
+	// Split the domain into labels
+	labels := strings.Split(domain, ".")
+
+	// Create a buffer to store the encoded domain name
+	buffer := make([]byte, 0)
+
+	for _, label := range labels {
+		// Encode the length of the label
+		buffer = append(buffer, byte(len(label)))
+
+		// Encode the label itself
+		buffer = append(buffer, []byte(label)...)
+	}
+
+	// Terminate the domain name with a null byte
+	buffer = append(buffer, 0)
 
 	return buffer
 }
